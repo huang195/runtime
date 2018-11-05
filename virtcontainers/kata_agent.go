@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -889,6 +890,12 @@ func (k *kataAgent) buildContainerRootfs(sandbox *Sandbox, c *Container, rootPat
 		return rootfs, nil
 	}
 
+	ch := make(chan error)
+	go bbfsMountContainerRootfs(k.ctx, kataHostSharedDir, sandbox.id, c.id, c.rootFs, ch, k)
+	if err := <-ch; err != nil {
+		return nil, err
+	}
+	k.Logger().Printf("bbfs mount succeeded\n")
 	// This is not a block based device rootfs.
 	// We are going to bind mount it into the 9pfs
 	// shared drive between the host and the guest.
@@ -897,11 +904,46 @@ func (k *kataAgent) buildContainerRootfs(sandbox *Sandbox, c *Container, rootPat
 	// (kataGuestSharedDir) is already mounted in the
 	// guest. We only need to mount the rootfs from
 	// the host and it will show up in the guest.
-	if err := bindMountContainerRootfs(k.ctx, kataHostSharedDir, sandbox.id, c.id, c.rootFs, false); err != nil {
-		return nil, err
-	}
+	//if err := bindMountContainerRootfs(k.ctx, kataHostSharedDir, sandbox.id, c.id, c.rootFs, false); err != nil {
+		//return nil, err
+	//}
 
 	return nil, nil
+}
+
+func bbfsMountContainerRootfs(ctx context.Context, sharedDir, sandboxID, cID, cRootFs string, c chan error, k *kataAgent) {
+	span, _ := trace(ctx, "bbfsMountContainerRootfs")
+	defer span.Finish()
+
+	rootfsDest := filepath.Join(sharedDir, sandboxID, cID, "rootfs")
+
+	absSource, err := filepath.EvalSymlinks(cRootFs)
+	if err != nil {
+		c <- err
+		return
+	}
+
+	if err := ensureDestinationExists(absSource, rootfsDest); err != nil {
+		c <- err
+		return
+	}
+
+	binary, err := exec.LookPath("bbfs-fuse");
+	if err != nil {
+		c <- err
+		return
+	}
+
+	cmd := exec.Command(binary, rootfsDest, cRootFs)
+	if err = cmd.Start(); err != nil {
+		c <- err
+		return
+	}
+
+	c <- nil
+	k.Logger().Printf("Started bbfs fuse process\n")
+	cmd.Wait()
+	k.Logger().Errorf("bbfs fuse process unexpectedly died\n")
 }
 
 func (k *kataAgent) createContainer(sandbox *Sandbox, c *Container) (p *Process, err error) {
